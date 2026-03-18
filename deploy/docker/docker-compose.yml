@@ -1,0 +1,58 @@
+services:
+  pingora:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "6191:6191"
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-dev-secret}
+      REDIS_URL: redis://redis:6379/
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-100}
+      RATE_LIMIT_WINDOW_S: ${RATE_LIMIT_WINDOW_S:-60}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-token}
+      RUST_LOG: ${RUST_LOG:-info}
+      OAUTH2_STRATEGY: ${OAUTH2_STRATEGY:-jwks}
+      OIDC_ISSUER: ${OIDC_ISSUER:-https://idp.example.com}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-api}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-api}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-https://api.example.com/callback}
+      OIDC_REQUIRED_SCOPES: ${OIDC_REQUIRED_SCOPES:-openid,api:read}
+      JWKS_REFRESH_SECS: ${JWKS_REFRESH_SECS:-3600}
+      OAUTH2_CLOCK_SKEW_SECS: ${OAUTH2_CLOCK_SKEW_SECS:-60}
+      INTROSPECT_CLIENT_ID: ${INTROSPECT_CLIENT_ID:-}
+      INTROSPECT_CLIENT_SECRET: ${INTROSPECT_CLIENT_SECRET:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - dmz
+      - intranet
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    networks:
+      - dmz
+    restart: unless-stopped
+
+  mock-service:
+    image: ealen/echo-server:latest
+    environment:
+      PORT: 8080
+    networks:
+      - intranet
+    restart: unless-stopped
+
+networks:
+  dmz:
+    driver: bridge
+  intranet:
+    driver: bridge
+    internal: true

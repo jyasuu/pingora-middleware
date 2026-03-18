@@ -1,0 +1,41 @@
+[package]
+name = "pingora-middleware"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pingora_middleware"
+path = "src/lib.rs"
+
+[[bin]]
+name = "proxy"
+path = "src/main.rs"
+
+[dependencies]
+pingora = { version = "0.5", features = ["lb"] }
+pingora-core = "0.5"
+pingora-http = "0.5"
+pingora-proxy = "0.5"
+pingora-load-balancing = "0.5"
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+http = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# Auth & OAuth2/OIDC
+jsonwebtoken = "9"          # JWT decode + RS256/ES256 validation
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }  # JWKS + introspection HTTP calls
+
+# Rate limiting
+redis = { version = "0.27", features = ["tokio-comp"] }   # upgraded: fixes future-incompat warning
+
+# Shared state
+arc-swap = "1"              # lock-free atomic Arc swaps for JWKS hot-reload
+tokio-util = "0.7"

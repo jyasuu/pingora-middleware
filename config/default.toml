@@ -1,0 +1,32 @@
+[server]
+bind_addr = "0.0.0.0:6191"
+threads = 4
+
+[upstream]
+addresses = [
+  "intranet-service-1:8080",
+  "intranet-service-2:8080",
+  "intranet-service-3:8080",
+]
+health_check_interval_secs = 5
+
+[canary]
+address = "intranet-canary:8080"
+fraction = 0.10
+
+[rate_limit]
+requests = 100
+window_secs = 60
+fail_open = true
+
+[oauth2]
+strategy = "jwks"           # jwks | introspect | discovery
+clock_skew_secs = 60
+jwks_refresh_secs = 3600
+required_scopes = ["api:read"]
+
+[auth]
+acl = [
+  { path_prefix = "/api/admin",    roles = ["admin"] },
+  { path_prefix = "/api/internal", roles = ["service", "admin"] },
+]
