@@ -35,7 +35,17 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 
 # Rate limiting
 redis = { version = "0.27", features = ["tokio-comp"] }   # upgraded: fixes future-incompat warning
+deadpool-redis = "0.18"     # connection pool for Redis (avoids per-request reconnect)
 
 # Shared state
 arc-swap = "1"              # lock-free atomic Arc swaps for JWKS hot-reload
 tokio-util = "0.7"
+
+# Stable hashing for canary routing
+rustc-hash = "2"            # FxHasher — stable across Rust versions, unlike DefaultHasher
+
+# URL building
+url = "2"                   # safe percent-encoding for redirect URIs / scopes
+
+# Random bytes for traceparent parent-id
+rand = "0.8"
