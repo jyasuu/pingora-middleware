@@ -185,8 +185,16 @@ impl OAuth2Service {
                 info!("OIDC discovery bootstrap complete for {}", self.issuer);
             }
             Strategy::Jwks => {
-                // Derive JWKS URI from issuer using the standard path
-                let uri = format!("{}/protocol/openid-connect/certs", self.issuer.trim_end_matches('/'));
+                // RFC 8414 / OIDC standard: fetch discovery to find jwks_uri.
+                // Falling back to a Keycloak-specific path breaks every other
+                // IdP (Auth0, Okta, Azure AD, Cognito, …).
+                // Allow an explicit override via JWKS_URI env var for edge cases.
+                let uri = if let Ok(explicit) = std::env::var("JWKS_URI") {
+                    explicit
+                } else {
+                    let doc = self.fetch_discovery().await?;
+                    doc.jwks_uri
+                };
                 *self.jwks_uri.write().await = Some(uri.clone());
                 self.refresh_jwks(&uri).await?;
                 info!("JWKS bootstrap complete from {uri}");
@@ -393,12 +401,32 @@ pub fn authorization_redirect_url(
     state: &str,
     scopes: &[&str],
 ) -> String {
-    let scope = scopes.join("%20");
+    // Each scope may contain `:` or other reserved chars — percent-encode them
+    // before joining with `%20` so the query string is well-formed.
+    fn pct_encode(s: &str, allow_colon_slash: bool) -> String {
+        s.bytes()
+            .flat_map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+                | b'-' | b'_' | b'.' | b'~' => vec![b as char],
+                b':' | b'/' if allow_colon_slash => vec![b as char],
+                other => format!("%{:02X}", other).chars().collect::<Vec<_>>(),
+            })
+            .collect()
+    }
+
+    let scope = scopes
+        .iter()
+        .map(|s| pct_encode(s, false))
+        .collect::<Vec<_>>()
+        .join("%20");
+
+    let encoded_redirect = pct_encode(redirect_uri, true);
+
     format!(
         "{issuer}/protocol/openid-connect/auth\
          ?response_type=code\
          &client_id={client_id}\
-         &redirect_uri={redirect_uri}\
+         &redirect_uri={encoded_redirect}\
          &scope={scope}\
          &state={state}"
     )

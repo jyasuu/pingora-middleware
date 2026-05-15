@@ -1,4 +1,7 @@
 use anyhow::Result;
+use redis::aio::MultiplexedConnection;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Sliding-window rate limiter backed by Redis.
 ///
@@ -11,10 +14,30 @@ use anyhow::Result;
 pub struct RateLimiter {
     max_requests: usize,
     window_secs: usize,
+    /// Shared multiplexed connection — created once at startup, reused across
+    /// all requests. Wrapping in Mutex<> satisfies Send + Sync across .await.
+    conn: Arc<Mutex<MultiplexedConnection>>,
 }
 
 impl RateLimiter {
+    /// Build from environment.  Must be called from inside a Tokio runtime
+    /// (i.e. after `server.bootstrap()`) because it opens the Redis connection.
     pub fn from_env() -> Self {
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+
+        // Open the connection ONCE at startup, not once per request.
+        let conn = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let client = redis::Client::open(redis_url)
+                    .expect("Invalid REDIS_URL");
+                client
+                    .get_multiplexed_async_connection()
+                    .await
+                    .expect("Failed to connect to Redis at startup")
+            })
+        });
+
         Self {
             max_requests: std::env::var("RATE_LIMIT_REQUESTS")
                 .ok()
@@ -24,21 +47,15 @@ impl RateLimiter {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            conn: Arc::new(Mutex::new(conn)),
         }
     }
 
-    /// Returns true if the request should be allowed, false if rate-limited.
+    /// Returns `true` if the request should be allowed, `false` if rate-limited.
     ///
     /// The key is typically the user ID so limits are per-identity, not per-IP.
-    /// For unauthenticated endpoints, use the client IP as the key.
     pub async fn is_allowed(&self, key: &str) -> Result<bool> {
-        // In a real deployment, hold a connection pool (bb8 + redis-rs) rather
-        // than opening a new connection per request.
-        let redis_url = std::env::var("REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
-
-        let client = redis::Client::open(redis_url)?;
-        let mut conn = client.get_multiplexed_async_connection().await?;
+        let mut conn = self.conn.lock().await;
 
         // Lua atomic sliding window:
         //   KEYS[1]  = rate limit key (e.g. "rl:user123")
@@ -75,7 +92,7 @@ impl RateLimiter {
             .arg(now)
             .arg(self.window_secs)
             .arg(self.max_requests)
-            .invoke_async(&mut conn)
+            .invoke_async(&mut *conn)
             .await?;
 
         Ok(result == 1)
