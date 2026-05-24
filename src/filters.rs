@@ -27,7 +27,12 @@ fn internal_token() -> String {
 type PResult<T> = Result<T, Box<PingoraError>>;
 
 fn to_perr(e: impl std::fmt::Display) -> Box<PingoraError> {
-    PingoraError::new_str(Box::leak(e.to_string().into_boxed_str()))
+    // PingoraError::explain() takes an owned String and avoids the memory leak
+    // that Box::leak causes (leaked memory is never reclaimed).
+    PingoraError::explain(
+        pingora::ErrorType::InternalError,
+        e.to_string(),
+    )
 }
 
 pub struct ProxyMiddleware {
@@ -235,10 +240,14 @@ async fn respond_with(
     error_code: &str,
     message: &str,
 ) -> PResult<bool> {
-    let body = Bytes::from(format!(
-        r#"{{"error":"{}","message":"{}","status":{}}}"#,
-        error_code, message, status
-    ));
+    // Use serde_json::json! to safely escape all string values, preventing
+    // JSON injection if an error message contains quotes or backslashes.
+    let json = serde_json::json!({
+        "error":   error_code,
+        "message": message,
+        "status":  status,
+    });
+    let body = Bytes::from(json.to_string());
     let mut resp = ResponseHeader::build(status, None).map_err(to_perr)?;
     resp.insert_header("content-type", "application/json").map_err(to_perr)?;
     resp.insert_header("content-length", body.len().to_string().as_str()).map_err(to_perr)?;

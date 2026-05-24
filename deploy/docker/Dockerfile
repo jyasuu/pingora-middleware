@@ -16,9 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Cache dependencies before copying source
+# Cache dependencies before copying source.
+# We need both main.rs (binary entry point) and lib.rs (library crate) as stubs
+# otherwise Cargo skips compiling lib dependencies, breaking the real build cache.
 COPY Cargo.toml ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN mkdir src \
+ && echo "fn main() {}" > src/main.rs \
+ && echo "" > src/lib.rs
 RUN cargo build --release 2>/dev/null || true
 RUN rm -rf src
 
@@ -32,6 +36,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid 1001 --no-create-home appuser

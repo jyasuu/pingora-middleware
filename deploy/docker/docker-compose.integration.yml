@@ -1,0 +1,114 @@
+## Integration-test stack
+##
+## Services
+##   mock-jwks  – Python OIDC/JWKS server that signs JWTs with a local RSA key.
+##                Supports grant_type=password (user tests) and
+##                grant_type=client_credentials (M2M tests).
+##                Also exposes /introspect for OAUTH2_STRATEGY=introspect runs.
+##   whoami     – traefik/whoami; reflects every received request header.
+##                Pingora proxies to it so tests can assert forwarded headers.
+##   redis      – rate-limiter store (same as prod).
+##   pingora    – built from repo root; upstream = whoami on the intranet net.
+##
+## Usage (from repo root):
+##   make integration-test
+##
+##   # or step by step:
+##   docker compose -f deploy/docker/docker-compose.integration.yml up --build -d
+##   PINGORA_URL=http://localhost:6191 MOCK_JWKS_URL=http://localhost:8888 \
+##     cargo test --test integration_test_e2e -- --nocapture
+##   docker compose -f deploy/docker/docker-compose.integration.yml down -v
+
+name: pingora-integration
+
+services:
+
+  # ── Mock OIDC / JWKS server ──────────────────────────────────────────────────
+  mock-jwks:
+    image: python:3.12-slim
+    command: python /app/mock_jwks.py
+    volumes:
+      - ../../tests/mock_jwks.py:/app/mock_jwks.py:ro
+    ports:
+      - "8888:8888"
+    networks:
+      - dmz
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8888/.well-known/openid-configuration')"
+      interval: 4s
+      timeout: 4s
+      retries: 15
+      start_period: 10s
+
+  # ── traefik/whoami: echoes request headers in response body ──────────────────
+  whoami:
+    image: traefik/whoami:latest
+    networks:
+      - intranet
+    # No external port — only Pingora reaches this via the intranet network
+
+  # ── Redis (rate-limiter) ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    networks:
+      - dmz
+
+  # ── Pingora proxy (built from source) ────────────────────────────────────────
+  pingora:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "6191:6191"
+    environment:
+      RUST_LOG: info
+      INTERNAL_SERVICE_TOKEN: integration-token
+
+      # Redis
+      REDIS_URL: redis://redis:6379/
+      RATE_LIMIT_REQUESTS: 10000
+      RATE_LIMIT_WINDOW_S: 60
+
+      # OAuth2 — point at mock server
+      OAUTH2_STRATEGY: jwks
+      OIDC_ISSUER: http://mock-jwks:8888
+      OIDC_AUDIENCE: test-client
+      OIDC_CLIENT_ID: test-client
+      OIDC_REDIRECT_URI: http://localhost/callback
+      OIDC_REQUIRED_SCOPES: api:read
+
+      # Skip discovery on first boot — use JWKS directly
+      JWKS_URI: http://mock-jwks:8888/jwks
+      JWKS_REFRESH_SECS: 3600
+
+      # 60-second leeway; expired tokens with exp_in=-120 are still rejected
+      OAUTH2_CLOCK_SKEW_SECS: 60
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-jwks:
+        condition: service_healthy
+      whoami:
+        condition: service_started
+    networks:
+      - dmz
+      - intranet
+    restart: "no"
+
+networks:
+  dmz:
+    driver: bridge
+  intranet:
+    driver: bridge
+    internal: true   # Pingora is the only gateway into the intranet

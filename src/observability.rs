@@ -1,6 +1,4 @@
-
 use crate::ctx::RequestCtx;
-use rand::Rng;
 use tracing::{error, info, warn};
 
 pub fn log_request(ctx: &RequestCtx, status: u16, path: &str, method: &str) {
@@ -58,25 +56,32 @@ pub fn log_request(ctx: &RequestCtx, status: u16, path: &str, method: &str) {
     }
 }
 
-/// Inject W3C trace context headers.
+/// Inject W3C `traceparent` and `x-trace-id` headers.
 ///
-/// traceparent format: 00-<32 hex trace-id>-<16 hex parent-id>-01
+/// W3C format: `00-<trace-id>-<parent-id>-<flags>`
+///   trace-id   must be 32 lowercase hex chars
+///   parent-id  must be 16 lowercase hex chars
 ///
-/// The trace_id is a UUID. We strip its dashes to get a valid 32-char lowercase
-/// hex trace-id. The parent-id is a fresh random 64-bit value encoded as 16 hex
-/// chars — per spec it must differ from the trace-id and be random per hop.
+/// The UUID-based `trace_id` is 36 chars with dashes; we strip the dashes to
+/// produce exactly 32 hex chars.  The parent-id is taken as the first 16 chars
+/// of that hex string.
 pub fn inject_trace_headers(
     headers: &mut pingora_http::RequestHeader,
     trace_id: &str,
 ) -> anyhow::Result<()> {
-    // UUID "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" → 32 hex chars, no dashes
-    let tid = trace_id.replace('-', "");
+    // Strip UUID dashes: "550e8400-e29b-41d4-a716-446655440000" → 32 hex chars
+    let trace_hex: String = trace_id.chars().filter(|c| *c != '-').collect();
 
-    // Random 64-bit parent-id, fresh per hop
-    let pid: u64 = rand::thread_rng().gen();
-    let pid_hex = format!("{pid:016x}");
+    // W3C requires exactly 32 hex chars for trace-id and 16 for parent-id.
+    // Pad or truncate defensively (UUIDs are always 32 hex chars after strip).
+    let trace_hex = if trace_hex.len() >= 32 {
+        trace_hex[..32].to_string()
+    } else {
+        format!("{:0<32}", trace_hex)
+    };
+    let parent_id = &trace_hex[..16];
 
-    let traceparent = format!("00-{tid}-{pid_hex}-01");
+    let traceparent = format!("00-{trace_hex}-{parent_id}-01");
     headers.insert_header("traceparent", &traceparent)?;
     headers.insert_header("x-trace-id", trace_id)?;
     Ok(())

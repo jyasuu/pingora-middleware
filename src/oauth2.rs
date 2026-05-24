@@ -1,4 +1,3 @@
-
 /// OAuth2/OIDC support for Pingora middleware.
 ///
 /// Implements three validation strategies, selectable via the
@@ -13,8 +12,6 @@
 ///   OIDC_ISSUER              https://your-idp.example.com
 ///   OIDC_AUDIENCE            your-api-client-id
 ///   OIDC_REQUIRED_SCOPES     api:read,api:write  (comma-separated, all must be present)
-///   JWKS_URI                 explicit JWKS endpoint (required for jwks strategy when
-///                            not using Keycloak; discovery derives it automatically)
 ///   JWKS_REFRESH_SECS        how often to refresh JWKS in background (default: 3600)
 ///   OAUTH2_CLOCK_SKEW_SECS   leeway for exp/nbf validation (default: 60)
 ///   INTROSPECT_CLIENT_ID     client_id for introspection endpoint
@@ -24,7 +21,6 @@ use anyhow::{anyhow, bail, Result};
 use arc_swap::ArcSwap;
 use jsonwebtoken::{
     decode, decode_header,
-    errors::ErrorKind,
     jwk::{AlgorithmParameters, JwkSet},
     Algorithm, DecodingKey, Validation,
 };
@@ -35,7 +31,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
-use url::Url;
 
 // ── Validated claims returned to the filter pipeline ─────────────────────────
 
@@ -91,9 +86,9 @@ struct IntrospectResponse {
 
 // ── JWKS cache entry ─────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct JwksCache {
     keyset: JwkSet,
-    #[allow(dead_code)]
     fetched_at: Instant,
 }
 
@@ -173,6 +168,7 @@ impl OAuth2Service {
                 .unwrap_or_default(),
         };
 
+        // Bootstrap: fetch discovery doc or JWKS immediately
         svc.bootstrap().await?;
         Ok(svc)
     }
@@ -189,19 +185,16 @@ impl OAuth2Service {
                 info!("OIDC discovery bootstrap complete for {}", self.issuer);
             }
             Strategy::Jwks => {
-                // Prefer an explicit JWKS_URI env var so this works with any IdP
-                // (Auth0, Azure AD, Okta, …).  Fall back to the Keycloak-style path
-                // only when JWKS_URI is not set, and emit a warning so operators know.
-                let uri = std::env::var("JWKS_URI").unwrap_or_else(|_| {
-                    warn!(
-                        "JWKS_URI not set; deriving from OIDC_ISSUER using Keycloak path. \
-                         Set JWKS_URI explicitly for non-Keycloak IdPs."
-                    );
-                    format!(
-                        "{}/protocol/openid-connect/certs",
-                        self.issuer.trim_end_matches('/')
-                    )
-                });
+                // RFC 8414 / OIDC standard: fetch discovery to find jwks_uri.
+                // Falling back to a Keycloak-specific path breaks every other
+                // IdP (Auth0, Okta, Azure AD, Cognito, …).
+                // Allow an explicit override via JWKS_URI env var for edge cases.
+                let uri = if let Ok(explicit) = std::env::var("JWKS_URI") {
+                    explicit
+                } else {
+                    let doc = self.fetch_discovery().await?;
+                    doc.jwks_uri
+                };
                 *self.jwks_uri.write().await = Some(uri.clone());
                 self.refresh_jwks(&uri).await?;
                 info!("JWKS bootstrap complete from {uri}");
@@ -243,6 +236,7 @@ impl OAuth2Service {
             .as_ref()
             .ok_or_else(|| anyhow!("JWKS not yet loaded"))?;
 
+        // Find the matching key by kid
         let jwk = cache
             .keyset
             .find(&kid)
@@ -257,9 +251,6 @@ impl OAuth2Service {
             _ => bail!("unsupported JWK algorithm"),
         };
 
-        // Only allow asymmetric algorithms — explicitly reject `none` and any
-        // HMAC variant so an attacker cannot downgrade to HS256 using the public
-        // key as the HMAC secret.
         let algorithm = match header.alg {
             jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
             jsonwebtoken::Algorithm::RS384 => Algorithm::RS384,
@@ -267,16 +258,13 @@ impl OAuth2Service {
             jsonwebtoken::Algorithm::ES256 => Algorithm::ES256,
             jsonwebtoken::Algorithm::ES384 => Algorithm::ES384,
             jsonwebtoken::Algorithm::EdDSA => Algorithm::EdDSA,
-            other => bail!("unsupported or disallowed algorithm: {other:?}"),
+            other => bail!("unsupported algorithm: {other:?}"),
         };
 
         let mut validation = Validation::new(algorithm);
-        // Disable_none is the default in jsonwebtoken ≥9, but be explicit.
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
         validation.leeway = self.clock_skew;
-        // Reject tokens that lack `exp`
-        validation.validate_exp = true;
 
         let data = decode::<RawClaims>(token, &decoding_key, &validation)?;
         Ok(claims_from_raw(data.claims))
@@ -340,6 +328,10 @@ impl OAuth2Service {
     }
 
     // ── Background JWKS refresh task ─────────────────────────────────────────
+    //
+    // Call this once at startup; it loops forever, refreshing on the configured
+    // interval. Pass the returned future to tokio::spawn or a Pingora background
+    // service.
 
     pub async fn run_jwks_refresh_loop(self: Arc<Self>) {
         let interval_secs: u64 = std::env::var("JWKS_REFRESH_SECS")
@@ -399,28 +391,9 @@ pub fn extract_token(headers: &pingora_http::RequestHeader) -> Option<String> {
     None
 }
 
-/// Classify a `jsonwebtoken` error into an RFC 6750 error code.
-///
-/// Matches on the typed `ErrorKind` instead of substring-matching the
-/// formatted message, which is fragile and locale-dependent.
-pub fn jwt_error_code(err: &jsonwebtoken::errors::Error) -> &'static str {
-    match err.kind() {
-        ErrorKind::ExpiredSignature => "token_expired",
-        ErrorKind::InvalidSignature
-        | ErrorKind::InvalidAlgorithmName
-        | ErrorKind::InvalidKeyFormat
-        | ErrorKind::InvalidAlgorithm => "invalid_token",
-        ErrorKind::InvalidAudience => "invalid_token",
-        ErrorKind::InvalidIssuer => "invalid_token",
-        _ => "invalid_token",
-    }
-}
-
 /// Build the IdP authorization redirect URL for the Authorization Code flow.
-///
-/// Uses the `url` crate for proper percent-encoding of the redirect URI and
-/// scopes, rather than manual string formatting which silently breaks when
-/// values contain `/`, `:`, `@`, etc.
+/// Pingora returns this as a 302 when no valid token is present and the
+/// request came from a browser (Accept: text/html).
 pub fn authorization_redirect_url(
     issuer: &str,
     client_id: &str,
@@ -428,24 +401,33 @@ pub fn authorization_redirect_url(
     state: &str,
     scopes: &[&str],
 ) -> String {
-    // Build on top of the issuer base; fall back to raw string concat if the
-    // issuer is not a valid URL (shouldn't happen in practice).
-    let base = format!("{}/protocol/openid-connect/auth", issuer.trim_end_matches('/'));
-
-    if let Ok(mut url) = Url::parse(&base) {
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", client_id)
-            .append_pair("redirect_uri", redirect_uri)
-            .append_pair("scope", &scopes.join(" "))
-            .append_pair("state", state);
-        url.to_string()
-    } else {
-        // Fallback — should not occur with a well-formed issuer
-        let scope = scopes.join("%20");
-        format!(
-            "{base}?response_type=code&client_id={client_id}\
-             &redirect_uri={redirect_uri}&scope={scope}&state={state}"
-        )
+    // Each scope may contain `:` or other reserved chars — percent-encode them
+    // before joining with `%20` so the query string is well-formed.
+    fn pct_encode(s: &str, allow_colon_slash: bool) -> String {
+        s.bytes()
+            .flat_map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+                | b'-' | b'_' | b'.' | b'~' => vec![b as char],
+                b':' | b'/' if allow_colon_slash => vec![b as char],
+                other => format!("%{:02X}", other).chars().collect::<Vec<_>>(),
+            })
+            .collect()
     }
+
+    let scope = scopes
+        .iter()
+        .map(|s| pct_encode(s, false))
+        .collect::<Vec<_>>()
+        .join("%20");
+
+    let encoded_redirect = pct_encode(redirect_uri, true);
+
+    format!(
+        "{issuer}/protocol/openid-connect/auth\
+         ?response_type=code\
+         &client_id={client_id}\
+         &redirect_uri={encoded_redirect}\
+         &scope={scope}\
+         &state={state}"
+    )
 }
