@@ -1,23 +1,25 @@
 ## Integration-test stack
 ##
 ## Services
-##   mock-jwks  – Python OIDC/JWKS server that signs JWTs with a local RSA key.
+##   mock-jwks  – Python OIDC/JWKS server (RSA-signed JWTs).
 ##                Supports grant_type=password (user tests) and
 ##                grant_type=client_credentials (M2M tests).
-##                Also exposes /introspect for OAUTH2_STRATEGY=introspect runs.
-##   whoami     – traefik/whoami; reflects every received request header.
-##                Pingora proxies to it so tests can assert forwarded headers.
-##   redis      – rate-limiter store (same as prod).
-##   pingora    – built from repo root; upstream = whoami on the intranet net.
+##                Also exposes /introspect for strategy=introspect runs.
+##   whoami     – traefik/whoami; echoes every request header back in the
+##                response body so tests can assert forwarded headers.
+##   redis      – rate-limiter store (same config as prod).
+##   pingora    – proxy under test.
+##                CI: set PINGORA_IMAGE=pingora-middleware:integration to use
+##                    a pre-built image and skip rebuilding inside compose.
+##                Local: omit PINGORA_IMAGE and compose builds from source.
 ##
-## Usage (from repo root):
+## Usage (local):
 ##   make integration-test
 ##
-##   # or step by step:
-##   docker compose -f deploy/docker/docker-compose.integration.yml up --build -d
-##   PINGORA_URL=http://localhost:6191 MOCK_JWKS_URL=http://localhost:8888 \
-##     cargo test --test integration_test_e2e -- --nocapture
-##   docker compose -f deploy/docker/docker-compose.integration.yml down -v
+## Usage (CI — pre-built image):
+##   PINGORA_IMAGE=pingora-middleware:integration \
+##   docker compose -f deploy/docker/docker-compose.integration.yml \
+##     up -d --no-build --wait
 
 name: pingora-integration
 
@@ -42,14 +44,13 @@ services:
       interval: 4s
       timeout: 4s
       retries: 15
-      start_period: 10s
+      start_period: 12s   # pip install cryptography + PyJWT on cold image
 
   # ── traefik/whoami: echoes request headers in response body ──────────────────
   whoami:
     image: traefik/whoami:latest
     networks:
       - intranet
-    # No external port — only Pingora reaches this via the intranet network
 
   # ── Redis (rate-limiter) ──────────────────────────────────────────────────────
   redis:
@@ -63,15 +64,18 @@ services:
     networks:
       - dmz
 
-  # ── Pingora proxy (built from source) ────────────────────────────────────────
+  # ── Pingora proxy ─────────────────────────────────────────────────────────────
+  # PINGORA_IMAGE env var: set to a pre-built tag in CI to skip rebuild.
+  # When PINGORA_IMAGE is empty, compose uses the build section (local dev).
   pingora:
+    image: ${PINGORA_IMAGE:-pingora-middleware:local}
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
       - "6191:6191"
     environment:
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
       INTERNAL_SERVICE_TOKEN: integration-token
 
       # Redis
@@ -79,7 +83,7 @@ services:
       RATE_LIMIT_REQUESTS: 10000
       RATE_LIMIT_WINDOW_S: 60
 
-      # OAuth2 — point at mock server
+      # OAuth2 — point at the mock server
       OAUTH2_STRATEGY: jwks
       OIDC_ISSUER: http://mock-jwks:8888
       OIDC_AUDIENCE: test-client
@@ -87,11 +91,11 @@ services:
       OIDC_REDIRECT_URI: http://localhost/callback
       OIDC_REQUIRED_SCOPES: api:read
 
-      # Skip discovery on first boot — use JWKS directly
+      # Skip discovery on first boot — use JWKS endpoint directly
       JWKS_URI: http://mock-jwks:8888/jwks
       JWKS_REFRESH_SECS: 3600
 
-      # 60-second leeway; expired tokens with exp_in=-120 are still rejected
+      # 60 s leeway; expired tokens with exp_in=-120 are still rejected
       OAUTH2_CLOCK_SKEW_SECS: 60
 
     depends_on:
@@ -105,10 +109,18 @@ services:
       - dmz
       - intranet
     restart: "no"
+    healthcheck:
+      # A 401 means Pingora is up and enforcing auth (correct behaviour)
+      test: ["CMD", "sh", "-c",
+             "curl -s -o /dev/null -w '%{http_code}' http://localhost:6191/api/healthz | grep -q 401"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 10s
 
 networks:
   dmz:
     driver: bridge
   intranet:
     driver: bridge
-    internal: true   # Pingora is the only gateway into the intranet
+    internal: true

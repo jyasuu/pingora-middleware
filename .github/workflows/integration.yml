@@ -1,0 +1,175 @@
+## integration.yml — E2E integration tests with Docker Compose
+##
+## Triggered on:
+##   • push / PR to main or master
+##   • manual dispatch (workflow_dispatch) for on-demand runs
+##   • scheduled nightly run at 02:00 UTC
+##
+## Jobs
+##   integration
+##     1. Build the Pingora Docker image (with layer caching)
+##     2. Start integration stack:  mock-jwks + whoami + redis + pingora
+##        (uses PINGORA_IMAGE so compose skips rebuilding)
+##     3. Smoke-test mock-jwks to confirm token issuance works
+##     4. Poll until Pingora responds 401 (proves auth is active)
+##     5. cargo test --test integration_test_e2e (modules A + B, 23 tests)
+##     6. Upload test output as artifact
+##     7. Dump container logs on failure
+##     8. Tear down stack
+##
+## Test coverage
+##   Module A: user / Authorization-Code tokens  (A-1 … A-11)
+##   Module B: client_credentials / M2M tokens   (B-1 … B-12)
+
+name: Integration Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      rust_log:
+        description: "RUST_LOG level for the Pingora container"
+        required: false
+        default: "info"
+  schedule:
+    - cron: "0 2 * * *"   # nightly at 02:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  COMPOSE_FILE: deploy/docker/docker-compose.integration.yml
+  PINGORA_IMAGE: pingora-middleware:integration
+
+jobs:
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Rust toolchain ────────────────────────────────────────────────────
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system deps (openssl, cmake — needed to compile tests)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake gcc make pkg-config libssl-dev
+
+      - name: Cache Cargo registry + build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      # ── 3. Docker setup + layer cache ────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 4. Build Pingora image ───────────────────────────────────────────────
+      # Build once here; pass PINGORA_IMAGE to compose so it doesn't rebuild.
+      - name: Build Pingora Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: false
+          load: true                          # loads into local Docker daemon
+          tags: ${{ env.PINGORA_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 5. Start integration stack ───────────────────────────────────────────
+      # --no-build: use the image we just built above
+      # --wait:     block until all healthchecks pass (or timeout)
+      - name: Start integration stack
+        env:
+          PINGORA_IMAGE: ${{ env.PINGORA_IMAGE }}
+          RUST_LOG: ${{ github.event.inputs.rust_log || 'info' }}
+        run: |
+          docker compose -f $COMPOSE_FILE \
+            up -d \
+            --no-build \
+            --wait \
+            --wait-timeout 120
+
+      # ── 6. Smoke-test mock-jwks ──────────────────────────────────────────────
+      - name: Smoke-test mock-jwks token endpoint
+        run: |
+          echo "=== User token (password grant) ==="
+          RESP=$(curl -sf -X POST http://localhost:8888/token \
+            -d "sub=smoke-user&roles=user&scopes=openid%20api:read")
+          echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'access_token' in d, f'missing access_token: {d}'"
+
+          echo "=== Client credentials grant ==="
+          RESP=$(curl -sf -X POST http://localhost:8888/token \
+            -d "grant_type=client_credentials&client_id=svc-smoke&client_secret=s&scope=api%3Aread&roles=service")
+          echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'access_token' in d, f'missing access_token: {d}'"
+
+          echo "mock-jwks OK"
+
+      # ── 7. Wait for Pingora readiness ────────────────────────────────────────
+      # The compose healthcheck already waits, but we add an explicit poll
+      # with clear output so CI logs show exactly when the proxy became ready.
+      - name: Wait for Pingora :6191 to return 401
+        run: |
+          for i in $(seq 1 60); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              http://localhost:6191/api/healthz 2>/dev/null || echo "000")
+            echo "  attempt $i/60 — HTTP $STATUS"
+            [ "$STATUS" = "401" ] && echo "Pingora ready" && exit 0
+            sleep 2
+          done
+          echo "ERROR: Pingora not ready after 120 s"
+          docker compose -f $COMPOSE_FILE logs --tail=100 pingora
+          exit 1
+
+      # ── 8. Run E2E tests ─────────────────────────────────────────────────────
+      - name: Run E2E integration tests
+        env:
+          PINGORA_URL: http://localhost:6191
+          MOCK_JWKS_URL: http://localhost:8888
+        run: |
+          cargo test --test integration_test_e2e -- --nocapture 2>&1 \
+            | tee test-output.txt
+          # tee swallows the exit code — recover it via PIPESTATUS
+          test "${PIPESTATUS[0]}" -eq 0
+
+      # ── 9. Upload test output ────────────────────────────────────────────────
+      - name: Upload test output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-output-${{ github.run_id }}
+          path: test-output.txt
+          retention-days: 14
+
+      # ── 10. Dump logs on failure ─────────────────────────────────────────────
+      - name: Dump container logs (on failure)
+        if: failure()
+        run: |
+          echo "════════════════ pingora ════════════════"
+          docker compose -f $COMPOSE_FILE logs --no-color --tail=200 pingora
+          echo "════════════════ mock-jwks ════════════════"
+          docker compose -f $COMPOSE_FILE logs --no-color --tail=100 mock-jwks
+          echo "════════════════ redis ════════════════"
+          docker compose -f $COMPOSE_FILE logs --no-color --tail=30  redis
+
+      # ── 11. Tear down ────────────────────────────────────────────────────────
+      - name: Tear down integration stack
+        if: always()
+        run: docker compose -f $COMPOSE_FILE down -v --remove-orphans
